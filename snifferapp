@@ -1,0 +1,455 @@
+/** @file main.c
+  */
+	 
+	 /* Dependencies ---------------------------------------------------------- */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <netinet/in.h>
+#include <errno.h>
+#include <unistd.h>
+#include <signal.h>
+#include <time.h>
+#include <sys/time.h>
+#include <poll.h>
+#include <semaphore.h>
+#include <pthread.h>
+//#include <l1apiApp_v0.2.1.h>
+#include "l1apiApp.h"           /* Exported interface for L1API app */
+#include "l1apiAppDownlink.h"   /* Handles all downlink traffic */
+#include "l1apiAppUplink.h"     /* Handles all uplink traffic */
+#include "l1apiAppStatistics.h" /* Handles all statistics gathering */
+#include "l1apiAppKeepAlive.h"  /* Keep Alive monitoring */
+//#include "l1apiAppSocket.h"     /* External socket interface */
+#include "l1api.h"              /* Exported interface for L1API */
+#include "armmsgtransport.h"
+#include "l1apiDebug.h"         /* L1Api Debug library */
+#include "snifferApp.h"
+	 
+	 /* Constants ---------------------------------------------------------------- */
+//Version
+#define VERSION_STRING        "v3.0.0"
+#define U_VERSION_MAJOR         3
+#define U_VERSION_MIDLE         0
+#define U_VERSION_MINOR         0
+#define U_VERSION_BUILD         "Merge_BASE_function"
+
+
+#define MSG_BUF_SIZE          L1API_MAX_BUF_SIZE
+	 
+#define NUM_POLLING_FDS       (2) /* 1xsocketFd, 1xL1Api_epollfd */
+
+#ifdef TRANSCEDE_TARGET	
+	 //
+	 // Internal structures
+	 // for  resloving param
+	 //
+	 typedef struct KeyTable
+	 {
+		 char *name;
+		 char *value;
+	 } KEYTABLE;
+	 
+	 //
+	 // Module variables
+	 //
+	 KEYTABLE Keys[MAXKEYS];
+	 char KeyBuffer[MAXKEYSIZE] = "";
+#endif
+
+
+	 /* Macros ------------------------------------------------------------------- */
+	 
+	 /* Types -------------------------------------------------------------------- */
+	 
+	 /* Private Variables -------------------------------------------------------- */
+	 
+	 /* Passed in argument variables */
+	 int cTestMode=0;
+	 
+	 //uint16_t cRxUdpPort;
+	 
+	 //uint16_t cTxUdpPort;	 
+	 
+	 unsigned int cPaDevNum;
+	 
+	 int cDebugLevel=0;
+	 
+	 char *cPaFileName = NULL;
+	 
+	 //char *cTargetAddress = NULL;
+	 
+	 /* These are set once we're open and are only placed here to
+	  * allow the signal handler to clean-up properly on application termination */
+	 //static int cSocketFd = -1;
+	 
+	 //static int cSocketConFd = -1;
+	 
+	 static L1API_Handle_t cL1ApiHandle = NULL;
+	 
+	 /* Private Function --------------------------------------------------------- */
+
+	 static int ParseArgVars(int argc, char *argv[]);
+
+#ifdef TRANSCEDE_TARGET
+	 static inline void logoPrint(void);		//print the logo info.
+#endif
+
+	 L1APIAPP_Error_t EstablishConnections(void);
+	 
+	 //static inline L1APIAPP_Error_t OpenSockets(void);
+	 
+	 //static inline void CloseSockets(void);
+	 
+	 static inline L1APIAPP_Error_t ConnectL1Api(void);
+	 
+	 static inline void CloseL1Api(void);
+	 
+	 static void SetupFdPolling(struct pollfd *pPollingFd);
+	 
+	 static void SigIntHandler(int sig); /* SIGINT handler */
+	 
+	 void (*OldSigHandler) (int) = NULL; /* Old SIGINT handler */
+	 
+	 static void TimerIRQ();
+	 
+	 static void InitTimerInterrupt(void);
+	 
+	 static void DLTimeConsume(int flag);
+	 
+	 static void ULTimeConsume(int flag);
+	 
+	 /* -------------------------------------------------------------------------- */
+	 
+	 /* -------------------------------------------------------------------------- */
+	 
+	 /* Public Functions */
+
+	 extern void NullTask(uint32_t cpuid);
+
+//#define UartPrint(...) printf(__VA_ARGS__)
+
+static void logoPrint(void)
+{
+    UartPrint(" \n");
+
+#ifdef TRANSCEDE_2200_TARGET
+    UartPrint("***********************************************\n");
+    UartPrint("SnifferTest Version Just For T2200 NewCode Test\n");
+    UartPrint("***********************************************\n");
+    sleep(5);
+#elif defined TRNASCEDE_3300_TARGET
+	UartPrint("***********************************************\n");
+	UartPrint("SnifferTest Version Just For T3300 NewCode Test\n");
+	UartPrint("***********************************************\n");
+	sleep(5);
+#endif
+
+    UartPrint("***********************************************\n");
+    UartPrint("  _    ________   _____     _______  __     __ \n");
+    UartPrint(" | |  |___   __| |  ___|   |__   __||  \\  /  |\n");
+    UartPrint(" | |      | |    | |_         | |   | _ \\/ _ |\n");
+    UartPrint(" | |      | |    |  _|        | |   | |\\  /| |\n");
+    UartPrint(" | |____  | |    | |___       | |   | | \\/ | |\n");
+    UartPrint(" |______| |_|    |_____|      |_|   |_|     |_|\n");
+    UartPrint("-----------------------------------------------\n");
+#ifdef LTE_RCT
+    UartPrint(" 		   R C T 	 T E S T M A C		  \n"); // Pure RCT test mac for customer
+#elif defined LTE_TCF
+    UartPrint(" 		   T C F	 T E S T M A C		  \n"); // TCF mode for automation test platform
+#elif defined LTE_RCT_TCF
+    UartPrint(" 		   R C F	 T E S T M A C		  \n"); // support RCT automation test platform
+#endif
+    UartPrint("-----------------------------------------------\n");
+    UartPrint("                  v%i.%i.%i.%s                \n", U_VERSION_MAJOR, U_VERSION_MIDLE, U_VERSION_MINOR, U_VERSION_BUILD);
+/*    UartPrint("----------------SHM: Dynamic Link -----------------------!\n");
+    UartPrint("----------------NMM: Support --nmm_mode for START.REQ !\n");	
+    UartPrint("----------------NMM: Support --nmm_nfft for FFT size!\n");		
+    UartPrint("----------------NMM: Support --enb_port..etc new params!\n");
+    UartPrint("----------------BUG: Fix RxSDU.cqiPmiConf Parse Issue!\n");
+    UartPrint("----------------NMM: Support --sync_mode for TDS SYNC function!\n");
+    UartPrint("----------------NMM: Support --sync_port for Getting TDS SYNC message from UDP port!\n");
+    UartPrint("----------------BUG: Fix HARQ bits location for PUCCH format 2a/2b!\n");
+    UartPrint("----------------NMM: Support --nmm_asn for SIB1 asn1 decode!\n");
+    UartPrint("----------------BUG: Fix PCI value error of NMM auto run!\n");
+    UartPrint("----------------MES: Support --rach RSSI value log data!\n");
+    UartPrint("----------------ENH: Resolving IP scan code matching !\n");
+    UartPrint("----------------BUG: Resolving HARQ bit error in PUCCH FMT2\2A\2B when reporting!\n");
+    UartPrint("----------------MES: Spport PUCCH/PUSCH RSSI report!\n");
+    UartPrint("----------------NMM: Init SYNC API changed and add init sync stop console command!\n");
+    UartPrint("----------------NMM: Nmm start command add para nfft size!\n");
+    UartPrint("----------------BUG: PUSCH/PUCCH RSSI report bug fix!\n");
+    UartPrint("----------------ENH: Klocwork checking result fix!\n");
+    UartPrint("----------------ENH: PUSCH aperiod CQI report feature!\n");
+    UartPrint("----------------PHY: SUPPORT new PHYAPI for aperiod cqi support !\n");
+    UartPrint("----------------NMM: SUPPORT new Command for manaully send sync request !\n");
+    UartPrint("----------------ENH: SUPPORT multiple HARQ !\n");
+    UartPrint("----------------ENH: SUPPORT SRS report!\n");
+    UartPrint("----------------ENH: SUPPORT distribut VRB !\n");
+*/    
+    UartPrint("***********************************************\n");
+
+}
+	 
+	 /* -------------------------------------------------------------------------- */
+	int main(int argc, char *argv[])
+	{
+		struct pollfd pollingFd[NUM_POLLING_FDS];
+
+#ifdef TRANSCEDE_TARGET
+		int i;
+		cpu_set_t cpuset;		//ready to distribute a certain thread a fixed processor
+		int rc,num;
+		
+		logoPrint();		//printf logo
+		num = sysconf(_SC_NPROCESSORS_CONF);		//"unistd.h"
+		if( num == 2)
+			UartPrint("----------------Residential\n");
+		else if (num == 4)
+			UartPrint("----------------Enterprise\n");
+#endif
+
+#if DEBUG
+	//	DebugSetRelativeTime();		 //record the current time as the starttime
+#endif
+#ifdef TRANSCEDE_TARGET	 
+	   // Read Arguments Information.
+	   if (argc > 3 )
+	   {		
+	   		DEBUG_PRINTF(DEBUG_ERROR, MODULE_L1APIAPP, "L1ApiApp(): Error : too many arguments, the number of arguments should not exceed 2\n");
+			return -1;
+	   }
+#endif	   
+		/* Parse the passed in arguments */
+	   if (ParseArgVars(argc, argv) != 0)
+	   {
+		 return -1;
+	   }
+	 
+	   /* Install SIGINT handler so that we can clean-up L1API if we're CTRL-C'd by the user */
+	   if ((OldSigHandler = signal(SIGINT, SigIntHandler)) == SIG_ERR)
+	   {
+		 DEBUG_PRINTF(DEBUG_ERROR, MODULE_L1APIAPP, "L1ApiApp(): Error : unable to install SIGINT handler\n");
+		 return -1;
+	   }
+	 
+	
+		 /* Delay to allow socket to clean-up after closing */
+		 sleep(1);
+	   
+	   return 0;
+	 }
+	 
+	 /* -------------------------------------------------------------------------- */
+	 
+	 /* -------------------------------------------------------------------------- */
+	 
+	 /* Private Functions */
+	 
+	 /* -------------------------------------------------------------------------- */
+	 static int ParseArgVars(int argc, char *argv[])
+	 {
+	 
+#ifdef TRANSCEDE_TARGET
+		int i, len;
+		char buffer[256];
+		char *name, *value;
+
+		for (i = 0; i < MAXKEYS; i++)
+    	{
+			Keys[i].name = NULL;
+			Keys[i].value = NULL;
+		}
+
+		// 1st - read command line settings
+    	i = 1;
+    	len = 0;
+    	while (i < argc)
+    	{
+			len += strlen(argv[i]) + 1;
+			if (len >= MAXKEYSIZE)
+			{
+				printf("Init: Param Command line too long\n");
+				break;
+			}
+			__strcat_chk(KeyBuffer, argv[i], MAXKEYSIZE);
+			__strcat_chk(KeyBuffer, " ", MAXKEYSIZE);
+			i++;
+		}
+		// 2nd Setting must have form "--var=val"
+		i = 0;
+		value = KeyBuffer;
+		do
+		{
+			name = strtok(value, "-= \n");
+			if (name)
+			{
+				/* Check the command-line args are correct */
+				if(0 == strcmp("help", name))
+				{
+					printf("usage : %s \n", argv[0]);
+					printf("  --help             [print usage info.] \n");
+					printf("  --DebugLevel=0/1   [set the debug level] \n");
+					printf("  --TestMode=0/1     [set test mode or work mode] \n");
+					printf("version : %s built : %s\n", VERSION_STRING, __DATE__ " " __TIME__);
+					return -1;
+				}
+				Keys[i].name = name;				
+				int flag_name=0;
+				if(0 == strcmp("DebugLevel", Keys[i].name))
+					flag_name=1;
+				else if(0 == strcmp("TestMode", Keys[i].name))
+					flag_name=2;
+				
+				value = strtok(NULL, "-= \n");
+				if (value)
+				{
+					Keys[i].value = value;
+					switch(flag_name){
+					/* Extract the debug level */
+						case 1: 
+						{
+							if (sscanf(value, "%d", &cDebugLevel) == 0)
+							{
+								printf("Error : Not a valid debug level '%s'\n", Keys[i].value);
+								return -1;
+							}
+	 						/* Set debug level */
+							printf("DebugLevel is '%d'\n",cDebugLevel);
+							break;
+						}
+						/* Extract the testcase for siniffer mode */
+						case 2:
+						{
+							if (sscanf(value, "%d", &cTestMode) == 0)
+							{
+								printf("Error : Not a valid debug level '%s'\n", Keys[i].value);
+								return -1;
+							}
+	 						/* Set debug level */
+							printf("TestMode is %d\n",cTestMode);
+							break;
+						}
+						default:
+							printf("out of range!\n");}
+				}
+				else
+				{
+					printf("Init: Invalid argument in command line [%s]\n", Keys[i].name);
+					Keys[i].name = NULL;
+					i--;
+				}
+				value = NULL;
+			}
+			i++;
+		} while ((name != NULL) && (i < MAXKEYS));
+		DebugSetLevel(cDebugLevel);
+		printf("DebugLevel is %d, TestMode is %d\n",cDebugLevel,cTestMode);
+	   DEBUG_PRINTF(DEBUG_TRACE5, MODULE_L1APIAPP, "DebugLevel=%d, TestMode=%d\n", cDebugLevel, cTestMode);
+#else
+printf("not right!");
+/*
+		if (argc < 5)
+		{
+			printf("usage : %s <[RxUdpPortNum] [TxUdpPortNum] [TxIpAddr] [PaDevNum] [DebugLevel]> <[picoArray file] (default NULL)>\n", argv[0]);
+			printf("version : %s built : %s\n", VERSION_STRING, __DATE__ " " __TIME__);
+			return -1;
+		}
+
+		
+		if (sscanf(argv[1], "%d", &cRxUdpPort) == 0)
+		{
+			printf("Error : Not a valid port number '%s'\n", argv[1]);
+			return -1;
+		}
+
+		if (sscanf(argv[2], "%d", &cTxUdpPort) == 0)
+		{
+			printf("Error : Not a valid port number '%s'\n", argv[2]);
+			return -1;
+		}
+
+		cpTxIpAddr = argv[3];
+
+		
+		if (sscanf(argv[4], "%u", &cPaDevNum) == 0)
+		{
+			printf("Error : Not a valid PA device number '%s'\n", argv[4]);
+			return -1;
+		}
+
+		if (argc > 5)
+		{
+			// Extract the debug level
+			if (sscanf(argv[5], "%d", &cDebugLevel) == 0)
+			{
+				printf("Error : Not a valid debug level '%s'\n", argv[5]);
+				return -1;
+  			}
+
+			// Set debug level 
+  			DebugSetLevel(cDebugLevel);
+		}
+
+		if (argc > 6)
+		{
+			// Extract the picoArray code filename 
+			cPaFileName = argv[6];
+		}
+
+		DEBUG_PRINTF(DEBUG_TRACE5, MODULE_L1APIAPP, "PaFileName = %s, Length = \n", cPaFileName, sizeof(cPaFileName));
+
+		if (argc > 7)
+		{
+			// Extract the target address for MII 
+			cTargetAddress = argv[7];
+		}
+
+		DEBUG_PRINTF(DEBUG_TRACE5, MODULE_L1APIAPP, "RxUdpPort=%d TxUdpPort=%d TxIp = %s PADevNum=%d DebugLevel=%d PAFileName=%s\n", cRxUdpPort, cTxUdpPort, cpTxIpAddr, cPaDevNum, cDebugLevel, cPaFileName);
+*/
+ 
+#endif
+	   return 0;
+	 }
+
+static void SigIntHandler(int sig)
+{
+  DEBUG_PRINTF(DEBUG_TRACE5, MODULE_L1APIAPP, "SigIntHandler() : entered\n");
+
+  printf("%s: Closing...\n", MODULE_L1APIAPP);
+
+  /* Shutdown the main application */
+  //CloseSockets();
+  //CloseL1Api();
+
+  /* Call previous handler */
+  if (OldSigHandler != NULL)
+  {
+    OldSigHandler(sig);
+  }
+
+  exit(0);
+}
+
+L1APIAPP_Error_t EstablishConnections(void)
+{
+	return L1APIAPP_NO_ERROR;
+}
+static inline L1APIAPP_Error_t ConnectL1Api(void)
+{
+	return L1APIAPP_NO_ERROR;
+}
+void CloseL1Api(void)
+{}
+static void SetupFdPolling(struct pollfd *pPollingFd)
+{}
+//void (*OldSigHandler) (int) = NULL; /* Old SIGINT handler */
+	 
+	 static void TimerIRQ(){}
+	 
+	 static void InitTimerInterrupt(void){}
+	 
+	 static void DLTimeConsume(int flag){}
+	 
+	 static void ULTimeConsume(int flag){}
